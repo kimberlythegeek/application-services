@@ -222,6 +222,132 @@ macro_rules! sync_merge_field_check {
     };
 }
 
+pub(super) fn common_get_outgoing_staging_records(
+    conn: &Connection,
+    data_sql: &str,
+    tombstones_sql: &str,
+    payload_from_data_row: &dyn Fn(&Row<'_>) -> Result<Payload>,
+) -> anyhow::Result<Vec<(String, String, i64)>> {
+    let outgoing_records =
+        common_get_outgoing_records(conn, data_sql, tombstones_sql, payload_from_data_row)?;
+    Ok(outgoing_records
+        .iter()
+        .map(|(payload, sync_change_counter)| {
+            (
+                payload.data.get("id").unwrap().to_string(),
+                payload.clone().into_json_string(),
+                *sync_change_counter as i64,
+            )
+        })
+        .collect::<Vec<(String, String, i64)>>())
+}
+
+fn get_outgoing_records(
+    conn: &Connection,
+    sql: &str,
+    payload_from_data_row: &dyn Fn(&Row<'_>) -> Result<Payload>,
+) -> anyhow::Result<Vec<(Payload, i64)>> {
+    Ok(conn
+        .prepare(sql)?
+        .query_map(NO_PARAMS, |row| {
+            Ok((
+                payload_from_data_row(row).unwrap(),
+                row.get::<_, i64>("sync_change_counter")?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<(Payload, i64)>, _>>()?)
+}
+
+pub(super) fn common_get_outgoing_records(
+    conn: &Connection,
+    data_sql: &str,
+    tombstone_sql: &str,
+    payload_from_data_row: &dyn Fn(&Row<'_>) -> Result<Payload>,
+) -> anyhow::Result<Vec<(Payload, i64)>> {
+    let mut payload = get_outgoing_records(conn, data_sql, payload_from_data_row)?;
+
+    payload.append(&mut get_outgoing_records(conn, tombstone_sql, &|row| {
+        Ok(Payload::new_tombstone(Guid::from_string(row.get("guid")?)))
+    })?);
+    Ok(payload)
+}
+
+pub(super) fn common_save_outgoing_records(
+    conn: &Connection,
+    table_name: &str,
+    staging_records: Vec<(String, String, i64)>,
+) -> anyhow::Result<()> {
+    let chunk_size = 3;
+    sql_support::each_sized_chunk(
+        &staging_records,
+        sql_support::default_max_variable_number() / chunk_size,
+        |chunk, _| -> anyhow::Result<()> {
+            let sql = format!(
+                "INSERT OR REPLACE INTO temp.{table_name} (guid, payload, sync_change_counter)
+                VALUES {staging_records}",
+                table_name = table_name,
+                staging_records = sql_support::repeat_multi_values(chunk.len(), chunk_size)
+            );
+            let mut params = Vec::with_capacity(chunk.len() * chunk_size);
+            for (guid, json, sync_change_counter) in chunk {
+                params.push(guid as &dyn ToSql);
+                params.push(json);
+                params.push(sync_change_counter);
+            }
+            conn.execute(&sql, params)?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+pub(super) fn common_reset_sync_change_counter(
+    conn: &Connection,
+    data_table_name: &str,
+    outgoing_table_name: &str,
+    records_synced: Vec<Guid>,
+) -> anyhow::Result<()> {
+    sql_support::each_chunk(&records_synced, |chunk, _| -> anyhow::Result<()> {
+        conn.execute(
+            &format!(
+                // We're making two checks that in practice should be redundant. First We're limiting to one
+                // the number of records that we're pulling from the outgoing staging table. Lastly we're
+                // ensuring that the updated local records are also in `records_synced` which should be the
+                // case since if the sync sync will fail entirely if the server rejects individual records.
+
+                "UPDATE {data_table_name} AS data
+                SET sync_change_counter = sync_change_counter - outgoing.sync_change_counter
+                FROM (SELECT sync_change_counter FROM temp.{outgoing_table_name} LIMIT 1) AS outgoing
+                WHERE guid IN ({values})
+                    AND data.guid = outgoing.guid",
+                data_table_name = data_table_name,
+                outgoing_table_name = outgoing_table_name,
+                values = sql_support::repeat_sql_values(chunk.len())
+            ),
+            chunk,
+        )?;
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+pub(super) fn common_push_outgoing_records(
+    conn: &Connection,
+    mirror_table_name: &str,
+    outgoing_staging_table_name: &str,
+) -> Result<()> {
+    let sql = format!(
+        "INSERT OR REPLACE INTO {mirror_table_name}
+            SELECT guid, payload FROM temp.{outgoing_staging_table_name}",
+        mirror_table_name = mirror_table_name,
+        outgoing_staging_table_name = outgoing_staging_table_name,
+    );
+    conn.execute(&sql, NO_PARAMS)?;
+
+    Ok(())
+}
+
 // And common helpers for tests (although no actual tests!)
 #[cfg(test)]
 pub(super) mod tests {
